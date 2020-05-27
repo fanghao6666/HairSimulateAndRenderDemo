@@ -1,0 +1,248 @@
+#define MAX_STRAND_VERTICES 16
+
+precision highp float;
+
+layout(local_size_x = 1, local_size_y = MAX_STRAND_VERTICES, local_size_z = 1) in;
+
+layout(std430, binding = REST_POSITIONS_BUFFER_BINDING) buffer RestPositions
+{
+    vec4 data[];
+} restPositions;
+
+layout(std430, binding = POSITIONS_BUFFER_BINDING) buffer Positions
+{
+    vec4 data[];
+} positions;
+
+layout(std430, binding = PREVIOUS_POSITIONS_BUFFER_BINDING) buffer PreviousPositions
+{
+    vec4 data[];
+} previousPositions;
+
+layout(std430, binding = TANGENTS_DISTANCES_BINDING) buffer TangentsDistances
+{
+    vec4 data[];
+} tangentsDistances;
+
+layout(std430, binding = REF_VECTORS_BINDING) buffer RefVectors
+{
+    vec4 data[];
+} refVectors;
+
+layout(std430, binding = GLOBAL_ROTATIONS_BINDING) buffer GlobalRotations
+{
+    vec4 data[];
+} globalRotations;
+
+layout(std430, binding = DEBUG_BUFFER_BINDING) buffer DebugBuffer
+{
+    vec4 data[];
+} debugBuffer;
+
+uniform mat4 modelMatrix;
+uniform int verticesPerStrand;
+uniform float timeStep;
+uniform float globalStiffness;
+uniform float localStiffness;
+uniform float damping;
+uniform vec3 gravity;
+uniform int lengthConstraintIterations;
+uniform int localShapeIterations;
+uniform mat4 windPyramid;
+
+shared vec4 sharedPositions[MAX_STRAND_VERTICES];
+
+bool isMovable(vec4 position)
+{
+    return position.w > 0;
+}
+
+vec4 makeQuaternion(float angle, vec3 axis)
+{
+    vec4 quaternion = vec4(0.0, 0.0, 0.0, 0.0);
+	float halfAngle = angle * 0.5f;
+	quaternion.w = cos(halfAngle);
+	quaternion.xyz = axis * sin(halfAngle);
+	return quaternion;
+}
+
+vec4 inverseQuaternion(vec4 quaternion)
+{
+    float lengthSqr = quaternion.x * quaternion.x + quaternion.y * quaternion.y + quaternion.z * quaternion.z + quaternion.w * quaternion.w;
+	if(lengthSqr < 0.001) {
+	    return vec4(0, 0, 0, 1.0f);
+	}
+
+	quaternion.x = -quaternion.x / lengthSqr;
+	quaternion.y = -quaternion.y / lengthSqr;
+	quaternion.z = -quaternion.z / lengthSqr;
+	quaternion.w = quaternion.w / lengthSqr;
+
+	return quaternion;
+}
+
+vec3 multQuaternionAndVector(vec4 q, vec3 v)
+{
+    vec3 qvec = q.xyz;
+    vec3 uv = cross(qvec, v);
+    vec3 uuv = cross(qvec, uv);
+    uv *= (2.0f * q.w);
+    uuv *= 2.0f;
+
+    return v + uv + uuv;
+}
+
+vec4 multQuaternionAndQuaternion(vec4 qA, vec4 qB)
+{
+    vec4 q;
+
+    q.w = qA.w * qB.w - qA.x * qB.x - qA.y * qB.y - qA.z * qB.z;
+    q.x = qA.w * qB.x + qA.x * qB.w + qA.y * qB.z - qA.z * qB.y;
+    q.y = qA.w * qB.y + qA.y * qB.w + qA.z * qB.x - qA.x * qB.z;
+    q.z = qA.w * qB.z + qA.z * qB.w + qA.x * qB.y - qA.y * qB.x;
+
+    return q;
+}
+
+vec2 constraintMultiplier(vec4 p0, vec4 p1)
+{
+    if(isMovable(p0)) {
+	    return isMovable(p1) ? vec2(0.5, 0.5) : vec2(1.0, 0.0);
+	}
+	else {
+	    return isMovable(p1) ? vec2(0.0, 1.0) : vec2(0.0, 0.0);
+	}
+}
+
+void updateFinalPositions(vec4 oldPosition, vec4 newPosition, int globalVertexIndex)
+{
+    positions.data[globalVertexIndex] = newPosition;
+	previousPositions.data[globalVertexIndex] = oldPosition;
+}
+
+vec4 integrate(vec4 currentPosition, vec4 oldPosition, vec3 force, float dampingCoeff)
+{
+    vec4 outputPos = currentPosition;
+	outputPos.xyz = currentPosition.xyz + (1.0 - dampingCoeff) * (currentPosition.xyz - oldPosition.xyz) + force * timeStep * timeStep;
+	return outputPos;
+}
+
+void applyDistanceConstraint(int index0, int index1, float targetDistance)
+{
+    vec4 p0 = sharedPositions[index0];
+	vec4 p1 = sharedPositions[index1];
+
+	vec3 delta = p1.xyz - p0.xyz;
+	float distance = max(length(delta), 1e-7);
+	float stretching = 1 - targetDistance / distance;
+	delta = delta * stretching;
+	vec2 multiplier = constraintMultiplier(p0, p1);
+
+	sharedPositions[index0].xyz += multiplier[0] * delta;
+	sharedPositions[index1].xyz -= multiplier[1] * delta;
+}
+
+vec3 calculateWindForce(int localID, int globalID) {
+    vec3 wind0 = windPyramid[0].xyz;
+	if(length(wind0) == 0 || localID < 2 || localID >= verticesPerStrand - 1) {
+	    return vec3(0.0, 0.0, 0.0);
+	}
+	float a = (globalID % 20) / 20.0f;
+	vec3 w = a * wind0 + (1.0 - a) * windPyramid[1].xyz + a * windPyramid[2].xyz + (1.0 - a) * windPyramid[3].xyz;
+	vec3 tangent = normalize(sharedPositions[localID].xyz - sharedPositions[localID + 1].xyz);
+	vec3 windForce = cross(cross(tangent, w), tangent);
+	return windForce;
+}
+
+void main()
+{
+    int globalID = int(gl_GlobalInvocationID.x);
+	int localID = int(gl_LocalInvocationID.y);
+
+	if(localID >= verticesPerStrand) {
+	    return;
+	}
+
+	int globalRootVertexIndex = globalID * (verticesPerStrand);
+	int globalVertexIndex = globalRootVertexIndex + localID;
+
+	vec4 currentPosition = positions.data[globalVertexIndex];
+	vec4 previousPosition = previousPositions.data[globalVertexIndex];
+	vec4 initialPosition = restPositions.data[globalVertexIndex];
+	vec4 tangentDistance = tangentsDistances.data[globalVertexIndex];
+	
+	//Fill shared positions
+	sharedPositions[localID] = currentPosition;
+	barrier();
+
+	//Apply forces using Verlet integration
+	if(isMovable(currentPosition)) {
+	    vec3 force = gravity + calculateWindForce(localID, globalID);
+	    sharedPositions[localID] = integrate(currentPosition, previousPosition, force, damping);
+	}
+
+	//Global stiffness
+	vec3 delta = globalStiffness * (initialPosition - sharedPositions[localID]).xyz;
+	sharedPositions[localID].xyz += delta;
+	barrier();
+
+	//Local shape
+	if(localID == 0) {
+	    for(int i = 0; i < localShapeIterations; i++) {
+		    vec4 position = sharedPositions[1];
+			vec4 globalRotation = globalRotations.data[globalRootVertexIndex];
+
+			for(int localVertexIndex = 1; localVertexIndex < verticesPerStrand - 1; localVertexIndex++) {
+			    vec4 positionNext = sharedPositions[localVertexIndex + 1];
+				vec3 localPositionNext = refVectors.data[globalRootVertexIndex + localVertexIndex + 1].xyz;
+				vec3 targetPositionNext = multQuaternionAndVector(globalRotation, localPositionNext) + position.xyz;
+
+				vec3 localDelta = localStiffness * (targetPositionNext - positionNext.xyz);
+
+				if(isMovable(position)) {
+				    position.xyz -= localDelta;
+				}
+
+				if(isMovable(positionNext)) {
+				    positionNext.xyz += localDelta;
+				}
+
+				vec4 globalRotationInv = inverseQuaternion(globalRotation);
+				vec3 tangent = normalize(positionNext.xyz - position.xyz);
+				vec3 localTangent = normalize(multQuaternionAndVector(globalRotationInv, tangent));
+				vec3 xAxis = vec3(1.0, 0, 0);
+				vec3 rotationAxis = cross(xAxis, localTangent);
+				float angle = acos(dot(xAxis, localTangent));
+
+				if(length(rotationAxis) > 0.001 && abs(angle) > 0.001) {
+					rotationAxis = normalize(rotationAxis);
+					vec4 localRotation = makeQuaternion(angle, rotationAxis);
+					globalRotation = multQuaternionAndQuaternion(globalRotation, localRotation);
+				}
+
+				sharedPositions[localVertexIndex].xyz = position.xyz;
+				sharedPositions[localVertexIndex + 1].xyz = positionNext.xyz;
+				position = positionNext;
+			}
+	    } 
+	}
+	barrier();
+
+	//Length constraints
+	for(int i = 0; i < lengthConstraintIterations; i++) {
+
+	    if(localID % 2 == 0 && localID < verticesPerStrand - 1) {
+		    applyDistanceConstraint(localID, localID + 1, tangentDistance.w);
+		}
+
+		barrier();
+
+		if(localID % 2 == 1 && localID < verticesPerStrand - 1) {
+		    applyDistanceConstraint(localID, localID + 1, tangentDistance.w);
+		}
+
+		barrier();
+	}
+
+	updateFinalPositions(currentPosition, sharedPositions[localID], globalVertexIndex);
+}
